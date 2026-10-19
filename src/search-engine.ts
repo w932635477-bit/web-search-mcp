@@ -1,7 +1,7 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import { SearchOptions, SearchResult, SearchResultWithMetadata } from './types.js';
-import { generateTimestamp, sanitizeQuery } from './utils.js';
+import { generateTimestamp, sanitizeQuery, getRandomUserAgent, delay } from './utils.js';
 import { RateLimiter } from './rate-limiter.js';
 import { BrowserPool } from './browser-pool.js';
 
@@ -33,9 +33,17 @@ export class SearchEngine {
         console.log(`[SearchEngine] Quality checking: ${enableQualityCheck}, threshold: ${qualityThreshold}, multi-engine: ${forceMultiEngine}, debug: ${debugBrowsers}`);
 
         // Try multiple approaches to get search results, starting with most reliable
+        // 2026-08-20 修复:Brave 实测必 ERR_ABORTED(反爬)删除;智谱 API 加为第一引擎
+        // (ZHIPU_API_KEY 配置时启用,失败如 1113 余额不足自动落到下一引擎)
+        // 2026-08-23 修复:加 cn.bing axios 直连为第二引擎。实测智谱余额不足(1113)+
+        // DDG 对本机 IP 全 202 挑战 + 国际 Bing 长查询降级返垃圾 = 三杀空结果;
+        // cn.bing.com 直连可用且中文/短查询质量好。
         const approaches = [
+          // 2026-10-19:DeepSeek 官方 Search API 提为第一引擎(官方接口,无爬虫风险)
+          { method: this.tryDeepSeekSearch.bind(this), name: 'DeepSeek API' },
+          { method: this.tryZhipuSearch.bind(this), name: 'Zhipu API' },
+          { method: this.tryCnBingSearch.bind(this), name: 'Axios cnBing' },
           { method: this.tryBrowserBingSearch.bind(this), name: 'Browser Bing' },
-          { method: this.tryBrowserBraveSearch.bind(this), name: 'Browser Brave' },
           { method: this.tryDuckDuckGoSearch.bind(this), name: 'Axios DuckDuckGo' }
         ];
         
@@ -48,8 +56,10 @@ export class SearchEngine {
           try {
             console.log(`[SearchEngine] Attempting ${approach.name} (${i + 1}/${approaches.length})...`);
             
-            // Use more aggressive timeouts for faster fallback
-            const approachTimeout = Math.min(timeout / 3, 4000); // Max 4 seconds per approach for faster fallback
+            // 2026-08-20 修复:原 Math.min(timeout/3, 4000)=每引擎 3.3s,Bing 实测首页
+            // 加载 1.5s+表单+解析 3-5s,稍抖即超时三杀 → engine None 空结果。
+            // 给足整段 timeout(默认 10s,内部 goto 用 timeout/2 已有自身上限)。
+            const approachTimeout = timeout;
             const results = await approach.method(sanitizedQuery, numResults, approachTimeout);
             if (results.length > 0) {
               console.log(`[SearchEngine] Found ${results.length} results with ${approach.name}`);
@@ -210,6 +220,120 @@ export class SearchEngine {
     } catch (error) {
       console.error(`[SearchEngine] Browser Brave search failed:`, error);
       throw error;
+    }
+  }
+
+  private async tryDeepSeekSearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
+    // DeepSeek 官方 Search API(2026-10-19 加):POST /v1/tools/search,Bearer 鉴权与 DeepSeek API 同源。
+    // 官方接口无爬虫/反爬问题,作为第一引擎;无 key 或任何失败直接 throw,主循环自动落到下一引擎。
+    const key = process.env.DEEPSEEK_API_KEY;
+    if (!key) throw new Error('DEEPSEEK_API_KEY not set');
+
+    const response = await axios.post(
+      'https://api.deepseek.com/v1/tools/search',
+      { query, count: numResults },
+      {
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        timeout,
+      }
+    );
+    const items = (response.data?.results || []) as Array<{
+      title?: string; url: string; summary?: string; snippet?: string; content?: string; date?: string;
+    }>;
+    if (items.length === 0) throw new Error('DeepSeek Search returned no results');
+    const timestamp = generateTimestamp();
+    return items.map((r) => {
+      const body = r.summary || r.snippet || '';
+      const full = r.content || body;
+      return {
+        title: r.title || r.url,
+        url: r.url,
+        description: body.slice(0, 500),
+        fullContent: full,
+        contentPreview: body.slice(0, 200),
+        wordCount: 0,
+        timestamp,
+        fetchStatus: 'success' as const,
+      };
+    });
+  }
+
+  private async tryZhipuSearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
+    // 智谱 GLM Web Search API(2026-08-20 加):API 不怕反爬/改版,配置 key 后随时可用。
+    // 无 key / 余额不足(1113)等任何失败直接 throw,主循环自动落到 Browser Bing。
+    const key = process.env.ZHIPU_API_KEY;
+    if (!key) throw new Error('ZHIPU_API_KEY not set');
+
+    const response = await axios.post(
+      'https://open.bigmodel.cn/api/paas/v4/web_search',
+      {
+        search_query: query,
+        search_engine: process.env.ZHIPU_SEARCH_ENGINE || 'search_std',
+        count: numResults,
+      },
+      { headers: { Authorization: `Bearer ${key}` }, timeout }
+    );
+    const items = (response.data?.search_result || []) as Array<{
+      title?: string; url: string; content?: string;
+    }>;
+    if (items.length === 0) throw new Error('Zhipu API returned no results');
+    const timestamp = generateTimestamp();
+    return items.map((r) => ({
+      title: r.title || r.url,
+      url: r.url,
+      description: (r.content || '').slice(0, 500),
+      fullContent: r.content || '',
+      contentPreview: (r.content || '').slice(0, 200),
+      wordCount: 0,
+      timestamp,
+      fetchStatus: 'success' as const,
+    }));
+  }
+
+  private async tryCnBingSearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
+    // cn.bing.com axios 直连(2026-08-23 加):智谱余额不足时的第一兜底,零浏览器开销。
+    // 长英文组合查询可能降级,靠主循环质量门拒;偶发 SSL 瞬断 → 重试 1 次。
+    const search = async (): Promise<SearchResult[]> => {
+      const response = await axios.get('https://cn.bing.com/search', {
+        params: { q: query, count: numResults },
+        headers: {
+          'User-Agent': getRandomUserAgent(),
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.5',
+        },
+        timeout,
+        validateStatus: (status: number) => status < 400,
+      });
+      const $ = cheerio.load(response.data);
+      const timestamp = generateTimestamp();
+      const results: SearchResult[] = [];
+      $('li.b_algo').each((_i, el) => {
+        if (results.length >= numResults) return;
+        const a = $(el).find('h2 a').first();
+        const url = a.attr('href') || '';
+        const title = a.text().trim();
+        if (!url.startsWith('http') || url.includes('bing.com/ck/') || !title) return;
+        const description = $(el).find('.b_caption p').first().text().trim() || $(el).find('p').first().text().trim();
+        results.push({
+          title,
+          url,
+          description: description.slice(0, 500),
+          fullContent: description,
+          contentPreview: description.slice(0, 200),
+          wordCount: 0,
+          timestamp,
+          fetchStatus: 'success' as const,
+        });
+      });
+      if (results.length === 0) throw new Error('cn.bing parsed no results');
+      return results;
+    };
+
+    try {
+      return await search();
+    } catch {
+      await delay(500);
+      return await search();
     }
   }
 

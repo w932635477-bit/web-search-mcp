@@ -79,6 +79,26 @@ export class ContentExtractor {
         }
       }
       
+      // 2026-10-19 加:DeepSeek 官方 Fetch 兜底(POST /v1/tools/fetch,Bearer 同源鉴权,
+      // 返回 Markdown)。直连与换头都被反爬挡住时走官方抓取服务。
+      const key = process.env.DEEPSEEK_API_KEY;
+      if (key) {
+        try {
+          const r = await axios.post(
+            'https://api.deepseek.com/v1/tools/fetch',
+            { url },
+            { headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, timeout }
+          );
+          const content = String(r.data?.content || '');
+          if (content.trim().length > 0) {
+            console.log(`[ContentExtractor] DeepSeek Fetch fallback worked for ${url}`);
+            return content.slice(0, maxContentLength);
+          }
+        } catch (dsError) {
+          console.error(`[ContentExtractor] DeepSeek Fetch fallback failed for ${url}:`, dsError);
+        }
+      }
+
       throw new Error(`Failed to extract content from ${url}: ${this.getSpecificErrorMessage(error)}`);
     }
   }
